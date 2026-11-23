@@ -202,6 +202,8 @@ pub struct ProjectFile {
     edition: SlintEdition,
     /// The file and byte range of the `#[edition]` of a `slint!` macro that sets `edition`.
     rust_macro_edition: Option<(SourcePath, core::ops::Range<usize>)>,
+    /// The text of the file and the byte range of each entry of `fonts`, when it has any.
+    font_spans: Option<(String, Vec<core::ops::Range<usize>>)>,
 }
 
 pub const FILE_NAME: &str = "slint-project.json";
@@ -470,6 +472,7 @@ impl ProjectFile {
 
     /// Parses project-file contents without reading from disk.
     pub fn parse(source_path: SourcePath, mut source: Vec<u8>) -> Result<Self, Box<dyn Error>> {
+        let original = source.clone();
         blank_out_comments(&mut source);
         let current = SlintEdition::current();
         let missing = || format!("'edition' is missing: add \"edition\": \"{current}\"").into();
@@ -489,8 +492,13 @@ impl ProjectFile {
         }
         let data: ProjectFileData = serde_json::from_slice(&source)?;
         let Some(edition) = data.edition else { return Err(missing()) };
+        let font_spans = data
+            .fonts
+            .is_some()
+            .then(|| String::from_utf8(original).ok().map(|text| (text, font_spans(&source))))
+            .flatten();
 
-        Ok(Self { source_path, data, edition, rust_macro_edition: None })
+        Ok(Self { source_path, data, edition, rust_macro_edition: None, font_spans })
     }
 
     pub async fn load_with_file_loader(
@@ -545,6 +553,26 @@ impl ProjectFile {
         self.data.fonts.as_ref()
     }
 
+    /// Where each entry of `fonts` is, for diagnostics about it.
+    pub fn font_locations(&self) -> Vec<SourceLocation> {
+        let fonts = self.data.fonts.as_deref().unwrap_or_default();
+        let (source_file, spans) = match &self.font_spans {
+            Some((text, spans)) => (
+                std::sync::Arc::new(SourceFileInner::new(self.source_path.clone(), text.clone())),
+                spans.as_slice(),
+            ),
+            None => (SourceFileInner::from_path_only(self.source_path.clone()), &[][..]),
+        };
+        (0..fonts.len())
+            .map(|index| SourceLocation {
+                source_file: Some(source_file.clone()),
+                span: spans
+                    .get(index)
+                    .map_or(Span::new(0, 0), |span| Span::new(span.start, span.len())),
+            })
+            .collect()
+    }
+
     pub fn experimental_features(&self) -> Option<crate::ExperimentalFeatures> {
         self.data.experimental_features
     }
@@ -578,6 +606,7 @@ impl ProjectFile {
             data: Default::default(),
             edition,
             rust_macro_edition: None,
+            font_spans: None,
         });
         project_file.data.edition = Some(edition);
         project_file.edition = edition;
@@ -610,15 +639,11 @@ impl ProjectFile {
     /// leaving the settings the project file doesn't specify untouched.
     /// Its experimental features add to the ones `compiler_config` already enables.
     pub fn apply_to(&self, compiler_config: &mut crate::CompilerConfiguration) {
-        self.resolved_data().apply_to(compiler_config);
+        let data = self.resolved_data();
+        data.apply_to(compiler_config);
         compiler_config.edition_location = Some(self.edition_location());
-        if self.data.fonts.is_some() {
-            compiler_config.fonts_location = Some(crate::diagnostics::SourceLocation {
-                source_file: Some(crate::diagnostics::SourceFileInner::from_path_only(
-                    self.source_path.clone(),
-                )),
-                span: crate::diagnostics::Span::new(0, 0),
-            });
+        if let Some(fonts) = data.fonts {
+            compiler_config.font_locations = fonts.into_iter().zip(self.font_locations()).collect();
         }
         compiler_config.project_roots = vec![normalize_project_root(self.source_path.clone())];
     }
@@ -854,6 +879,89 @@ impl Overrides {
 fn replace_if_supplied<T>(target: &mut Option<T>, supplied: Option<T>) {
     if supplied.is_some() {
         *target = supplied;
+    }
+}
+
+/// The byte ranges of the strings in the `fonts` array of the top-level object in `source`,
+/// valid JSON without comments.
+fn font_spans(source: &[u8]) -> Vec<core::ops::Range<usize>> {
+    let skip_whitespace = |index: &mut usize| {
+        while source.get(*index).is_some_and(u8::is_ascii_whitespace) {
+            *index += 1;
+        }
+    };
+    // The range of the string that starts at `index`, quotes included.
+    let string = |index: &mut usize| {
+        let start = *index;
+        *index += 1;
+        while let Some(byte) = source.get(*index) {
+            *index += if *byte == b'\\' { 2 } else { 1 };
+            if *byte == b'"' {
+                break;
+            }
+        }
+        start..*index
+    };
+    let skip_value = |index: &mut usize| {
+        let mut depth = 0usize;
+        while let Some(byte) = source.get(*index) {
+            match byte {
+                b'"' => {
+                    string(index);
+                    if depth == 0 {
+                        return;
+                    }
+                    continue;
+                }
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' if depth == 0 => return,
+                b'}' | b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        *index += 1;
+                        return;
+                    }
+                }
+                b',' if depth == 0 => return,
+                _ => {}
+            }
+            *index += 1;
+        }
+    };
+
+    let mut index = 0;
+    skip_whitespace(&mut index);
+    if source.get(index) != Some(&b'{') {
+        return Vec::new();
+    }
+    index += 1;
+    loop {
+        skip_whitespace(&mut index);
+        if source.get(index) != Some(&b'"') {
+            return Vec::new();
+        }
+        let key = string(&mut index);
+        skip_whitespace(&mut index);
+        index += 1; // ':'
+        skip_whitespace(&mut index);
+        if &source[key] == b"\"fonts\"" && source.get(index) == Some(&b'[') {
+            let mut spans = Vec::new();
+            index += 1;
+            loop {
+                skip_whitespace(&mut index);
+                match source.get(index) {
+                    Some(b'"') => spans.push(string(&mut index)),
+                    Some(b',') => index += 1,
+                    _ => return spans,
+                }
+            }
+        }
+        skip_value(&mut index);
+        skip_whitespace(&mut index);
+        if source.get(index) != Some(&b',') {
+            return Vec::new();
+        }
+        index += 1;
     }
 }
 
@@ -1389,6 +1497,23 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn font_locations_point_at_the_entries() {
+        let source = r#"{
+            // "fonts": ["commented.ttf"],
+            "library-paths": { "fonts": "nested" },
+            "edition": "1.20",
+            "fonts": ["a.ttf", "with \"quote\".ttf"]
+        }"#;
+        let project = load_project_file(source).unwrap();
+        let entries: Vec<_> = project
+            .font_locations()
+            .iter()
+            .map(|location| &source[location.span.offset..][..location.span.length])
+            .collect();
+        assert_eq!(entries, [r#""a.ttf""#, r#""with \"quote\".ttf""#]);
     }
 
     #[test]
